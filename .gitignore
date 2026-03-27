@@ -1,0 +1,11 @@
+archive
+logs/*.txt
+logs/*.csv
+*/__pycache__
+source/__pycache__
+*.pyc
+*.env
+*.pem
+*.log
+commands_history.md
+tests.ipynb

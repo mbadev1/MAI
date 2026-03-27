@@ -1,0 +1,54 @@
+{
+    "groups": [
+        {
+            "name": "group2",
+            "server_ip": "128.214.254.204",
+            "port": 8080,
+            "input_device": 0,
+            "output_device": 0,
+            "input_channels": [3],
+            "output_channels": [3],
+            "audio_folder_path": "audio/mai2.0-finnish"
+        },
+        {
+            "name": "group3",
+            "server_ip": "128.214.255.139",
+            "port": 8080,
+            "input_device": 0,
+            "output_device": 0,
+            "input_channels": [5],
+            "output_channels": [5],
+            "audio_folder_path": "audio/mai2.0-finnish"
+        },
+        {
+            "name": "group4",
+            "server_ip": "86.50.168.55",
+            "port": 8080,
+            "input_device": 0,
+            "output_device": 0,
+            "input_channels": [7],
+            "output_channels": [7],
+            "audio_folder_path": "audio/mai2.0-finnish"
+        },
+        {
+            "name": "group5",
+            "server_ip": "86.50.168.59",
+            "port": 8080,
+            "input_device": 0,
+            "output_device": 0,
+            "input_channels": [9],
+            "output_channels": [9],
+            "audio_folder_path": "audio/mai2.0-english"
+        },
+        {
+            "name": "group6",
+            "server_ip": "86.50.168.202",
+            "port": 8080,
+            "input_device": 0,
+            "output_device": 0,
+            "input_channels": [11],
+            "output_channels": [11],
+            "audio_folder_path": "audio/mai2.0-english"
+        }
+    ]
+}

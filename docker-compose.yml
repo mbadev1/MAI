@@ -1,0 +1,49 @@
+version: '3.8'
+
+services:
+  clair_mai_5000:
+    image: clair-mai:0.2
+    container_name: clair_mai_5000
+    restart: unless-stopped
+    ports:
+      - "5000:5000"
+    env_file:
+      - .env
+    environment:
+      - CLAIR_TOKEN=4y4CTTlGZVA
+    volumes:
+      - ./source:/app/source
+      - ./audio:/app/audio
+      - ./logs:/app/logs
+    command: /bin/bash -c "conda run --no-capture-output -n voice python server.py"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  # clair_mai_5001:
+  #   image: clair-mai:0.2
+  #   container_name: clair_mai_5001
+  #   restart: unless-stopped
+  #   ports:
+  #     - "5001:5000"
+  #   env_file:
+  #     - .env
+  #   environment:
+  #     - CLAIR_TOKEN=NcMr362KrMw
+  #   volumes:
+  #     - ./source:/app/source
+  #     - ./audio:/app/audio
+  #     - ./logs:/app/logs
+  #   command: /bin/bash -c "conda run --no-capture-output -n voice python server.py"
+  #   deploy:
+  #     resources:
+  #       reservations:
+  #         devices:
+  #           - driver: nvidia
+  #             count: all
+  #             capabilities: [gpu]
+

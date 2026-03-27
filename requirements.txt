@@ -1,0 +1,13 @@
+python-dotenv==1.0.1
+termcolor==2.4.0
+diart==0.7.0
+whisper_timestamped==1.12.20
+onnxruntime==1.17.1
+pydub==0.25.1
+simpleaudio==1.0.4
+pyttsx3==2.90
+websocket-client==1.2.3
+numpy==1.23.5
+pyannote.audio==2.1.1
+pytorch-lightning==1.6.5
+torch==1.13.1
