@@ -69,10 +69,6 @@ def setup_logger(name, log_file, level=logging.INFO):
 
 logger = setup_logger('unified_client', 'logs/unified_client.log')
 
-# Global lock – serialises sd.play() so multiple group threads never fight
-# over the ASIO output device simultaneously.
-PLAYBACK_LOCK = threading.Lock()
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -118,35 +114,49 @@ def drain_queue(q):
 
 class SharedAsioInput:
     """
-    Opens a single ASIO InputStream that captures every channel required by
-    any group, then distributes audio blocks into per-group queues.
+    One shared ASIO duplex stream (input + output).
+
+    Using a single ASIO stream avoids "device busy" conditions that happen
+    when capture and playback try to open separate ASIO clients.
     """
 
     MAX_QUEUE_SIZE = 500  # drop oldest block when a consumer falls behind
 
-    def __init__(self, device, all_channels_1based, sample_rate, block_size):
-        self.all_channels = sorted(set(all_channels_1based))
+    def __init__(self, device, all_input_channels_1based,
+                 all_output_channels_1based, sample_rate, block_size):
+        self.all_channels = sorted(set(all_input_channels_1based))
+        self.all_output_channels = sorted(set(all_output_channels_1based))
         self.sample_rate = sample_rate
         self.block_size = block_size
         self.device = device
 
-        # Map 1-based physical channel → column index in callback indata
+        # Input mapping: 1-based physical channel -> indata column
         self._channel_to_col = {
             ch: i for i, ch in enumerate(self.all_channels)
         }
+        # Output mapping: 1-based physical channel -> outdata column
+        self._output_channel_to_col = {
+            ch: i for i, ch in enumerate(self.all_output_channels)
+        }
 
-        self._subscribers = {}  # name → (col_indices_list, Queue)
+        self._subscribers = {}  # name -> (input_col_indices_list, Queue)
         self._lock = threading.Lock()
+        self._playback_queue = queue.Queue(maxsize=self.MAX_QUEUE_SIZE)
+        self._active_playbacks = []
 
-        selectors = [ch - 1 for ch in self.all_channels]
-        self._stream = sd.InputStream(
-            channels=len(selectors),
+        in_selectors = [ch - 1 for ch in self.all_channels]
+        out_selectors = [ch - 1 for ch in self.all_output_channels]
+        self._stream = sd.Stream(
+            channels=(len(in_selectors), len(out_selectors)),
             samplerate=sample_rate,
             latency=0,
             blocksize=block_size,
             callback=self._callback,
             device=device,
-            extra_settings=sd.AsioSettings(channel_selectors=selectors),
+            extra_settings=(
+                sd.AsioSettings(channel_selectors=in_selectors),
+                sd.AsioSettings(channel_selectors=out_selectors),
+            ),
         )
 
     def add_group(self, name, channels_1based):
@@ -157,12 +167,100 @@ class SharedAsioInput:
             self._subscribers[name] = (cols, q)
         return q
 
+    def enqueue_playback(self, audio_data, sample_rate, output_channels_1based):
+        """Queue one playback chunk onto selected physical output channels."""
+        if audio_data is None:
+            return
+
+        data = np.asarray(audio_data)
+        if data.dtype == np.int16:
+            data = data.astype(np.float32) / 32768.0
+        else:
+            data = data.astype(np.float32, copy=False)
+
+        if data.ndim == 1:
+            data = data[:, np.newaxis]
+
+        out_ch = list(output_channels_1based)
+        if not out_ch:
+            return
+
+        if data.shape[1] != len(out_ch):
+            mono = data.mean(axis=1, keepdims=True)
+            if len(out_ch) > 1:
+                data = np.tile(mono, (1, len(out_ch)))
+            else:
+                data = mono
+
+        if int(sample_rate) != int(self.sample_rate):
+            resampled = []
+            for col in range(data.shape[1]):
+                resampled.append(
+                    resample_poly(data[:, col], self.sample_rate, int(sample_rate))
+                )
+            min_len = min(len(col_data) for col_data in resampled)
+            data = np.stack([col_data[:min_len] for col_data in resampled], axis=1)
+
+        out_cols = [
+            self._output_channel_to_col[ch]
+            for ch in out_ch
+            if ch in self._output_channel_to_col
+        ]
+        if not out_cols:
+            return
+
+        item = {
+            'data': data,
+            'position': 0,
+            'out_cols': out_cols,
+        }
+        try:
+            self._playback_queue.put_nowait(item)
+        except queue.Full:
+            try:
+                self._playback_queue.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self._playback_queue.put_nowait(item)
+            except queue.Full:
+                pass
+
     # -- audio callback (runs in real-time thread – keep fast) -------------
 
-    def _callback(self, indata, frames, time_info, status):
+    def _callback(self, indata, outdata, frames, time_info, status):
         if status:
             logger.warning(f"SharedAsioInput status: {status}")
+
+        outdata.fill(0.0)
+
         with self._lock:
+            while True:
+                try:
+                    self._active_playbacks.append(self._playback_queue.get_nowait())
+                except queue.Empty:
+                    break
+
+            still_active = []
+            for pb in self._active_playbacks:
+                data = pb['data']
+                pos = pb['position']
+                out_cols = pb['out_cols']
+                remaining = data.shape[0] - pos
+                if remaining <= 0:
+                    continue
+
+                chunk = min(frames, remaining)
+                segment = data[pos:pos + chunk, :]
+                for src_col, out_col in enumerate(out_cols):
+                    if src_col < segment.shape[1] and out_col < outdata.shape[1]:
+                        outdata[:chunk, out_col] += segment[:, src_col]
+
+                pb['position'] += chunk
+                if pb['position'] < data.shape[0]:
+                    still_active.append(pb)
+            self._active_playbacks = still_active
+
             for _name, (cols, q) in self._subscribers.items():
                 chunk = indata[:, cols].copy()
                 try:
@@ -177,6 +275,8 @@ class SharedAsioInput:
                         q.put_nowait(chunk)
                     except queue.Full:
                         pass
+
+        np.clip(outdata, -1.0, 1.0, out=outdata)
 
     def start(self):
         self._stream.start()
@@ -265,13 +365,13 @@ class GroupAudioSource:
 
 
 # ---------------------------------------------------------------------------
-# Audio playback manager (unchanged logic, added PLAYBACK_LOCK)
+# Audio playback manager (routes playback to shared ASIO duplex stream)
 # ---------------------------------------------------------------------------
 
 class AudioManager:
-    def __init__(self, output_device, audio_folder_path, output_channels=None):
+    def __init__(self, playback_router, audio_folder_path, output_channels=None):
         logger.info("Initializing AudioManager.")
-        self.output_device = output_device
+        self.playback_router = playback_router
         self.audio_folder_path = audio_folder_path
         if output_channels is None:
             self.output_channels = None
@@ -322,16 +422,12 @@ class AudioManager:
                 data = np.tile(
                     data[:, np.newaxis], (1, len(self.output_channels)))
 
-            play_kwargs = {
-                'device': self.output_device,
-                'blocksize': 4096,
-            }
-            if self.output_channels:
-                play_kwargs['mapping'] = self.output_channels
-
-            with PLAYBACK_LOCK:
-                sd.play(data, sr, **play_kwargs)
-                sd.wait()
+            out_channels = self.output_channels if self.output_channels else [1]
+            self.playback_router.enqueue_playback(
+                audio_data=data,
+                sample_rate=sr,
+                output_channels_1based=out_channels,
+            )
             logger.info(f"Played audio: {variation}")
         except Exception as e:
             logger.error(
@@ -673,8 +769,21 @@ if __name__ == "__main__":
     capture_rates = {}   # global_device_idx → negotiated sample rate
 
     for global_dev, dev_groups in device_groups.items():
+        if any(g['_global_output'] != global_dev for g in dev_groups):
+            logger.error(
+                "ASIO duplex mode requires input_device and output_device "
+                "to be the same physical ASIO device per group."
+            )
+            logger.error(
+                f"Input device {global_dev} has groups with mixed output devices."
+            )
+            sys.exit(1)
+
         all_channels = sorted(set(
             ch for g in dev_groups for ch in g['input_channels']
+        ))
+        all_output_channels = sorted(set(
+            ch for g in dev_groups for ch in g['output_channels']
         ))
 
         capture_rate = negotiate_capture_rate(
@@ -683,7 +792,12 @@ if __name__ == "__main__":
 
         block_size = int(PIPELINE_STEP * capture_rate)
         shared = SharedAsioInput(
-            global_dev, all_channels, capture_rate, block_size)
+            global_dev,
+            all_channels,
+            all_output_channels,
+            capture_rate,
+            block_size,
+        )
         shared_inputs[global_dev] = shared
 
         for g in dev_groups:
@@ -699,7 +813,8 @@ if __name__ == "__main__":
         logger.info(
             f"Shared ASIO input started on device {global_dev} "
             f"(rate={capture_rates[global_dev]} Hz, "
-            f"channels={shared.all_channels})")
+            f"in_channels={shared.all_channels}, "
+            f"out_channels={shared.all_output_channels})")
 
     # ---- Launch one thread per group ----------------------------------
 
@@ -716,7 +831,7 @@ if __name__ == "__main__":
             sys.exit(1)
 
         audio_mgr = AudioManager(
-            group['_global_output'],
+            shared_inputs[global_dev],
             audio_folder,
             output_channels=group['output_channels'],
         )
