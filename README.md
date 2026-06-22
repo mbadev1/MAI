@@ -1,4 +1,4 @@
-# Clair-MAI
+# MAI
 
 Documentation under construction...
 
